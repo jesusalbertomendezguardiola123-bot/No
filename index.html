@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#000000">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<title>Cubos 3D</title>
+<style>
+  *{box-sizing:border-box}
+  [hidden]{display:none!important}
+  html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}
+  #v{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);z-index:0}
+  #dim{position:fixed;inset:0;z-index:1;pointer-events:none;background:radial-gradient(ellipse at center,rgba(10,12,20,.2),rgba(10,12,20,.6))}
+  #gl{position:fixed;inset:0;width:100%;height:100%;z-index:2}
+  #ui{position:fixed;inset:0;z-index:3;pointer-events:none}
+  #ov{position:fixed;inset:0;width:100%;height:100%;z-index:9;pointer-events:none}
+  #topbar{position:absolute;top:calc(10px + env(safe-area-inset-top,0));left:50%;transform:translateX(-50%);display:flex;gap:14px;padding:7px 18px;border-radius:30px;background:rgba(25,27,32,.6);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border:1px solid rgba(255,255,255,.1);font-size:14px}
+  #hudg{position:absolute;top:calc(10px + env(safe-area-inset-top,0));left:0;right:0;display:flex;justify-content:center}
+  #hudg .info{padding:10px 20px;border-radius:30px;background:rgba(25,27,32,.65);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border:1px solid rgba(255,255,255,.12);font-size:15px;font-weight:600}
+  #msg{position:absolute;left:0;right:0;top:calc(64px + env(safe-area-inset-top,0));text-align:center;font-size:15px;text-shadow:0 1px 4px #000}
+  #splash{position:fixed;inset:0;z-index:20;background:radial-gradient(circle at 50% 35%,#27304a,#0b0d14);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;text-align:center;padding:28px}
+  #splash h1{margin:0;font-size:32px;font-weight:700}
+  #splash p{margin:0;max-width:310px;line-height:1.45;color:#b9bec9;font-size:15px}
+  #splash .big{font-size:56px}
+  #go{height:58px;padding:0 42px;border-radius:30px;background:#fff;color:#111;font-size:20px;font-weight:600;display:inline-flex;align-items:center}
+  #err{color:#ff7a7a!important}
+</style>
+<script type="importmap">
+{"imports":{
+ "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+ "cannon-es":"https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js",
+ "@mediapipe/tasks-vision":"https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"
+}}
+</script>
+</head>
+<body>
+<video id="v" playsinline muted></video>
+<div id="dim"></div>
+<canvas id="gl"></canvas>
+<div id="ui">
+  <div id="topbar"><span id="clock">--:--</span><span id="batt">🖐️ Manos</span></div>
+  <div id="hudg" hidden><div class="info" id="info">🧊 Cubos 3D</div></div>
+  <div id="msg"></div>
+</div>
+<canvas id="ov"></canvas>
+<div id="splash">
+  <div class="big">🖐️🧊</div>
+  <h1>Cubos 3D</h1>
+  <p>Menú flotante en 3D y cubos con físicas que agarras con tus manos usando la cámara frontal. Pellizca con el pulgar y el índice para seleccionar.</p>
+  <span id="go">Empezar</span>
+  <p id="err"></p>
+</div>
+
+<script type="module">
+import * as THREE from "three";
+import * as CANNON from "cannon-es";
+import { HandLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+
+const $ = id => document.getElementById(id);
+const S = { pinch:0.40, skeleton:true, count:8 };
+let mode = null;            // null (menú) | "sandbox" | "tower"
+let page = "home";          // home | settings | game
+let W = innerWidth, H = innerHeight, dpr = Math.min(devicePixelRatio || 1, 2);
+
+// ================= Three.js =================
+const D = 3, Dm = 2.2, FOV = 60, TAN = Math.tan(FOV*Math.PI/360);
+const renderer = new THREE.WebGLRenderer({ canvas:$("gl"), alpha:true, antialias:true });
+renderer.setClearColor(0x000000, 0);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(FOV, 1, 0.1, 50);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x556677, 1.0));
+const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+sun.position.set(1.5, 4, 0.5); sun.target.position.set(0, 0, -D);
+sun.castShadow = true; sun.shadow.mapSize.set(1024, 1024);
+Object.assign(sun.shadow.camera, { left:-3, right:3, top:3, bottom:-3, near:0.5, far:12 });
+scene.add(sun, sun.target);
+const cursorLight = new THREE.PointLight(0xffffff, 0, 4);
+scene.add(cursorLight);
+const shadowFloor = new THREE.Mesh(new THREE.PlaneGeometry(12, 12), new THREE.ShadowMaterial({ opacity:0.4 }));
+shadowFloor.rotation.x = -Math.PI/2; shadowFloor.receiveShadow = true;
+scene.add(shadowFloor);
+
+let hw = 1, hh = 1, floorY = -1, baseS = 0.2, pxPerM = 1;
+
+// ================= Cannon =================
+const world = new CANNON.World({ gravity:new CANNON.Vec3(0, -9.8, 0) });
+world.defaultContactMaterial.friction = 0.5;
+world.defaultContactMaterial.restitution = 0.2;
+world.solver.iterations = 12;
+let statics = [];
+function box(w, h, d, x, y, z){
+  const b = new CANNON.Body({ mass:0, shape:new CANNON.Box(new CANNON.Vec3(w/2, h/2, d/2)) });
+  b.position.set(x, y, z); world.addBody(b); statics.push(b);
+}
+function buildBounds(){
+  statics.forEach(b => world.removeBody(b)); statics = [];
+  const t = 1;
+  box(30, t, 30, 0, floorY - t/2, -D);
+  box(30, t, 30, 0, hh + t/2 + 0.5, -D);
+  box(t, 30, 30, -hw - t/2, 0, -D);
+  box(t, 30, 30,  hw + t/2, 0, -D);
+  box(30, 30, t, 0, 0, -D - 0.6 - t/2);
+  box(30, 30, t, 0, 0, -D + 0.6 + t/2);
+  shadowFloor.position.set(0, floorY + 0.002, -D);
+}
+
+// ================= Menú 3D =================
+const panelMat = new THREE.MeshStandardMaterial({ color:0x161922, roughness:0.5, metalness:0.1, transparent:true, opacity:0.66 });
+function rrShape(w, h, r){
+  const s = new THREE.Shape(), x = -w/2, y = -h/2;
+  s.moveTo(x+r, y); s.lineTo(x+w-r, y); s.quadraticCurveTo(x+w, y, x+w, y+r);
+  s.lineTo(x+w, y+h-r); s.quadraticCurveTo(x+w, y+h, x+w-r, y+h);
+  s.lineTo(x+r, y+h); s.quadraticCurveTo(x, y+h, x, y+h-r);
+  s.lineTo(x, y+r); s.quadraticCurveTo(x, y, x+r, y);
+  return s;
+}
+function rrGeo(w, h, r, d){
+  const g = new THREE.ExtrudeGeometry(rrShape(w, h, r), { depth:d, bevelEnabled:true, bevelThickness:d*0.25, bevelSize:d*0.25, bevelSegments:2, curveSegments:8 });
+  g.translate(0, 0, -d/2); return g;
+}
+function makeLabel(wu, hu, draw, ppu = 1024){
+  const cv = document.createElement("canvas");
+  cv.width = Math.max(8, Math.round(wu*ppu)); cv.height = Math.max(8, Math.round(hu*ppu));
+  const c = cv.getContext("2d");
+  const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4;
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(wu, hu), new THREE.MeshBasicMaterial({ map:tex, transparent:true, depthWrite:false, toneMapped:false }));
+  return { mesh, set(...a){ c.clearRect(0, 0, cv.width, cv.height); draw(c, cv.width, cv.height, ...a); tex.needsUpdate = true; } };
+}
+const FONT = "system-ui,'Apple Color Emoji','Noto Color Emoji',sans-serif";
+const textDraw = (color, align = "center", weight = "600") => (c, w, h, text) => {
+  let px = h*0.6; c.font = weight + " " + px + "px " + FONT;
+  while(c.measureText(text).width > w*0.96 && px > 10){ px -= 2; c.font = weight + " " + px + "px " + FONT; }
+  c.fillStyle = color; c.textBaseline = "middle"; c.textAlign = align;
+  c.fillText(text, align === "left" ? w*0.02 : align === "right" ? w*0.98 : w/2, h/2 + px*0.04);
+};
+function makeButton(w, h, act, label, o = {}){
+  const d = o.depth || 0.05, r = o.r || Math.min(w, h)*0.28;
+  const g = new THREE.Group();
+  const mat = new THREE.MeshStandardMaterial({ color:o.color || 0x3b4254, roughness:0.4, metalness:0.1, transparent:true, opacity:0.95, emissive:0xffffff, emissiveIntensity:0 });
+  const body = new THREE.Mesh(rrGeo(w, h, r, d), mat); g.add(body);
+  label.mesh.position.z = d/2 + d*0.25 + 0.003; g.add(label.mesh);
+  const btn = { group:g, body, mat, act, pressT:0 }; body.userData.btn = btn;
+  return btn;
+}
+const menuRoot = new THREE.Group(), homeG = new THREE.Group(), setG = new THREE.Group(), dockG = new THREE.Group(), barRoot = new THREE.Group();
+menuRoot.add(homeG, setG, dockG); scene.add(menuRoot, barRoot);
+const homeBtns = [], setBtns = [], dockBtns = [], barBtns = [];
+let skelTile, pvLbl, cvLbl, skelLbl;
+
+function panel(g, title, sub){
+  g.add(new THREE.Mesh(rrGeo(1, 1.25, 0.07, 0.04), panelMat));
+  const t = makeLabel(0.9, 0.1, textDraw("#fff", "center", "700")); t.set(title); t.mesh.position.set(0, 0.52, 0.034); g.add(t.mesh);
+  const s = makeLabel(0.94, 0.05, textDraw("#b9bec9", "center", "400")); s.set(sub); s.mesh.position.set(0, 0.43, 0.034); g.add(s.mesh);
+}
+// Home
+panel(homeG, "Biblioteca", "Pellizca con el pulgar y el índice");
+const tileDraw = (c, w, h, icon, name, desc) => {
+  c.textAlign = "center"; c.textBaseline = "middle";
+  c.font = (h*0.38) + "px " + FONT; c.fillStyle = "#fff"; c.fillText(icon, w/2, h*0.36);
+  c.font = "700 " + (h*0.105) + "px " + FONT; c.fillText(name, w/2, h*0.70);
+  c.font = "400 " + (h*0.07) + "px " + FONT; c.fillStyle = "#b9bec9"; c.fillText(desc, w/2, h*0.84);
+};
+[["sandbox","🧊","Cubos 3D","Juego libre",-0.24,0.15],["tower","🏗️","Torre","Apila alto",0.24,0.15],
+ ["settings","⚙️","Ajustes","Pellizco y cubos",-0.24,-0.33],["skel","🖐️","Manos","",0.24,-0.33]].forEach(([act, ic, nm, ds, x, y]) => {
+  const lb = makeLabel(0.44, 0.44, tileDraw); lb.set(ic, nm, ds);
+  const b = makeButton(0.44, 0.44, act, lb, { r:0.07 }); b.group.position.set(x, y, 0.068);
+  homeG.add(b.group); homeBtns.push(b);
+  if(act === "skel") skelTile = lb;
+});
+// Ajustes
+panel(setG, "Ajustes", "Calibra el seguimiento de tus manos");
+function row(y, text){ const l = makeLabel(0.5, 0.1, textDraw("#fff", "left", "500")); l.set(text); l.mesh.position.set(-0.21, y, 0.034); setG.add(l.mesh); }
+function value(x, y){ const l = makeLabel(0.14, 0.1, textDraw("#fff", "center", "700")); l.mesh.position.set(x, y, 0.034); setG.add(l.mesh); return l; }
+function pill(act, text, x, y, wd = 0.12){
+  const lb = makeLabel(wd, 0.12, textDraw("#fff", "center", "700")); lb.set(text);
+  const b = makeButton(wd, 0.12, act, lb, { r:0.05, depth:0.04 }); b.group.position.set(x, y, 0.06);
+  setG.add(b.group); setBtns.push(b); return lb;
+}
+row(0.25, "Sensibilidad pellizco"); pill("p-", "−", 0.17, 0.25); pvLbl = value(0.30, 0.25); pill("p+", "+", 0.43, 0.25);
+row(0.02, "Cubos iniciales");      pill("c-", "−", 0.17, 0.02); cvLbl = value(0.30, 0.02); pill("c+", "+", 0.43, 0.02);
+row(-0.21, "Esqueleto de mano");   skelLbl = pill("skel", "Sí", 0.36, -0.21, 0.2);
+pill("home", "← Volver", 0, -0.46, 0.5);
+// Dock
+const dockBack = new THREE.Mesh(rrGeo(0.76, 0.2, 0.1, 0.03), panelMat); dockBack.position.z = 0; dockG.add(dockBack);
+[["home","🏠"],["sandbox","🧊"],["tower","🏗️"],["settings","⚙️"]].forEach(([act, e], i) => {
+  const lb = makeLabel(0.16, 0.16, (c, w, h, em) => { c.font = (h*0.55) + "px " + FONT; c.textAlign = "center"; c.textBaseline = "middle"; c.fillText(em, w/2, h/2 + h*0.04); });
+  lb.set(e);
+  const b = makeButton(0.16, 0.16, act, lb, { r:0.08, depth:0.04, color:0x434a5e }); b.group.position.set(-0.27 + i*0.18, 0, 0.04);
+  dockG.add(b.group); dockBtns.push(b);
+});
+dockG.position.set(0, -0.78, 0.01);
+// Barra dentro del juego
+[["home","☰ Menú",-0.33],["more","＋ Cubos",0],["reset","↺ Reiniciar",0.33]].forEach(([act, t, x]) => {
+  const lb = makeLabel(0.3, 0.12, textDraw("#fff", "center", "700")); lb.set(t);
+  const b = makeButton(0.3, 0.12, act, lb, { r:0.05, depth:0.05, color:0x232733 }); b.group.position.set(x, 0, 0);
+  barRoot.add(b.group); barBtns.push(b);
+});
+
+function layoutMenu(){
+  const hhm = TAN*Dm, hwm = hhm*(W/H);
+  const pw = Math.min(1.5, hwm*1.8, hhm*1.1);
+  menuRoot.scale.setScalar(pw);
+  menuRoot.userData.baseY = 0.11*pw; menuRoot.position.set(0, menuRoot.userData.baseY, -Dm);
+  const bs = Math.min(1.2, hwm*0.95/0.48);
+  barRoot.scale.setScalar(bs); barRoot.userData.baseY = -hhm*0.84; barRoot.position.set(0, barRoot.userData.baseY, -Dm);
+}
+function resize(){
+  W = innerWidth; H = innerHeight;
+  renderer.setPixelRatio(dpr); renderer.setSize(W, H, false);
+  const ov = $("ov"); ov.width = W*dpr; ov.height = H*dpr;
+  camera.aspect = W/H; camera.updateProjectionMatrix();
+  hh = TAN*D; hw = hh*(W/H);
+  floorY = -hh*0.78;
+  baseS = Math.min(0.30, Math.max(0.12, hw*0.26));
+  pxPerM = H/(2*hh);
+  buildBounds(); layoutMenu();
+}
+addEventListener("resize", resize);
+
+// ================= Cubos =================
+const cubes = [];
+const palette = [0xff595e, 0xffca3a, 0x8ac926, 0x1982c4, 0x6a4c93, 0xff924c, 0x2ec4b6];
+function addCube(s, x, y, z, color){
+  const body = new CANNON.Body({ mass:1, shape:new CANNON.Box(new CANNON.Vec3(s/2, s/2, s/2)), linearDamping:0.05, angularDamping:0.25 });
+  body.position.set(x, y, z);
+  const geo = new THREE.BoxGeometry(s, s, s);
+  const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color, roughness:0.35, metalness:0.05 }));
+  mesh.castShadow = true;
+  mesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color:0xffffff, transparent:true, opacity:0.4 })));
+  scene.add(mesh); world.addBody(body);
+  cubes.push({ body, mesh, s });
+}
+function clearCubes(){
+  for(const c of cubes){ scene.remove(c.mesh); c.mesh.geometry.dispose(); world.removeBody(c.body); }
+  cubes.length = 0; hs.forEach(h => h.grab = null);
+}
+function spawn(n){
+  if(mode === "tower"){
+    const s = baseS, gap = s*1.3, cols = Math.max(1, Math.floor((2*hw - s)/gap)), start = cubes.length;
+    for(let i=0;i<n;i++){
+      const k = start + i, col = k % cols, row = Math.floor(k/cols);
+      addCube(s, -((cols-1)*gap)/2 + col*gap, floorY + s/2 + row*s*1.05, -D, palette[k % palette.length]);
+    }
+  } else {
+    for(let i=0;i<n;i++){
+      const s = baseS*(0.8 + Math.random()*0.4);
+      addCube(s, (Math.random()*2-1)*(hw - s), floorY + s + Math.random()*hh*0.8, -D + (Math.random()-0.5)*0.5, palette[(Math.random()*palette.length)|0]);
+      cubes[cubes.length-1].body.quaternion.setFromEuler(Math.random()*3, Math.random()*3, Math.random()*3);
+    }
+  }
+}
+function resetGame(){ clearCubes(); spawn(S.count); }
+
+// ================= Manos =================
+let landmarker = null, vw = 1, vh = 1;
+const video = $("v");
+function map(lm){
+  const s = Math.max(W/vw, H/vh), ox = (W - vw*s)/2, oy = (H - vh*s)/2;
+  return { x: ox + (vw - lm.x*vw)*s, y: oy + lm.y*vh*s };
+}
+const dist = (a, b) => Math.hypot(a.x-b.x, a.y-b.y);
+const TIPS = [4, 8, 12, 16, 20, 9];
+function mkHand(){
+  const bodies = TIPS.map(() => {
+    const b = new CANNON.Body({ mass:0, type:CANNON.Body.KINEMATIC, shape:new CANNON.Sphere(0.05) });
+    b.position.set(0, -50, 0); world.addBody(b); return b;
+  });
+  return { P:null, pt:null, tip:null, cur:null, down:false, grab:null, bodies };
+}
+const hs = [mkHand(), mkHand()];
+const toWorld = p => ({ x:(p.x/W*2 - 1)*hw, y:(1 - p.y/H*2)*hh, z:-D });
+const cursor = h => mode ? h.pt : h.cur;
+
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+const activeButtons = () => mode ? barBtns : [...(page === "settings" ? setBtns : homeBtns), ...dockBtns];
+function pick(p){
+  ndc.set(p.x/W*2 - 1, -(p.y/H*2 - 1));
+  ray.setFromCamera(ndc, camera);
+  const hit = ray.intersectObjects(activeButtons().map(b => b.body), false)[0];
+  return hit ? hit.object.userData.btn : null;
+}
+function press(b){ b.pressT = 0.18; act(b.act); }
+
+function startPinch(h){
+  const c = cursor(h);
+  const b = pick(c);
+  if(b){ press(b); return; }
+  if(!mode) return;
+  let best = null, bd = 1e9; const v = new THREE.Vector3();
+  for(const c2 of cubes){
+    if(hs.some(o => o.grab === c2)) continue;
+    v.copy(c2.mesh.position).project(camera);
+    const sx = (v.x+1)/2*W, sy = (1-v.y)/2*H;
+    const d = Math.hypot(sx - h.pt.x, sy - h.pt.y), r = c2.s*pxPerM*0.9 + 36;
+    if(d < r && d < bd){ bd = d; best = c2; }
+  }
+  if(best) h.grab = best;
+}
+function processHand(h, lms){
+  if(!lms){ h.down = false; h.grab = null; h.P = null; h.pt = null; h.tip = null; h.cur = null; return; }
+  const P = lms.map(map); h.P = P;
+  const palm = dist(P[0], P[9]) || 1, ratio = dist(P[4], P[8])/palm;
+  const lerp = (a, b, k) => a ? { x:a.x+(b.x-a.x)*k, y:a.y+(b.y-a.y)*k } : { x:b.x, y:b.y };
+  h.pt  = lerp(h.pt,  { x:(P[4].x+P[8].x)/2, y:(P[4].y+P[8].y)/2 }, 0.6);
+  h.tip = lerp(h.tip, P[8], 0.5);
+  if(!h.cur || ratio > S.pinch + 0.2) h.cur = { x:h.tip.x, y:h.tip.y };
+  if(!h.down && ratio < S.pinch){ h.down = true; startPinch(h); }
+  else if(h.down && ratio > S.pinch + 0.17){ h.down = false; h.grab = null; }
+}
+
+// ================= UI / estados =================
+function show(p){
+  page = p;
+  const g = p === "game";
+  homeG.visible = p === "home"; setG.visible = p === "settings"; dockG.visible = !g;
+  barRoot.visible = g;
+  $("dim").hidden = g; $("topbar").hidden = g; $("hudg").hidden = !g;
+  cubes.forEach(c => c.mesh.visible = g);
+}
+function startGame(m){ mode = m; show("game"); resetGame(); }
+function refresh(){
+  pvLbl.set(String(Math.round(S.pinch*100)));
+  cvLbl.set(String(S.count));
+  skelLbl.set(S.skeleton ? "Sí" : "No");
+  skelTile.set("🖐️", "Manos", "Esqueleto: " + (S.skeleton ? "sí" : "no"));
+}
+function act(a){
+  switch(a){
+    case "sandbox": case "tower": startGame(a); break;
+    case "home": mode = null; show("home"); break;
+    case "settings": mode = null; show("settings"); break;
+    case "more": spawn(3); break;
+    case "reset": resetGame(); break;
+    case "p-": S.pinch = Math.max(0.25, +(S.pinch - 0.03).toFixed(2)); break;
+    case "p+": S.pinch = Math.min(0.6, +(S.pinch + 0.03).toFixed(2)); break;
+    case "c-": S.count = Math.max(3, S.count - 1); break;
+    case "c+": S.count = Math.min(24, S.count + 1); break;
+    case "skel": S.skeleton = !S.skeleton; break;
+  }
+  refresh();
+}
+// toque con el dedo también funciona
+addEventListener("pointerdown", e => { if(!started) return; const b = pick({ x:e.clientX, y:e.clientY }); if(b) press(b); });
+function clock(){ const d = new Date(); $("clock").textContent = String(d.getHours()).padStart(2,"0") + ":" + String(d.getMinutes()).padStart(2,"0"); }
+setInterval(clock, 10000); clock();
+if(navigator.getBattery) navigator.getBattery().then(b => { const f = () => $("batt").textContent = "🔋 " + Math.round(b.level*100) + "%"; f(); b.onlevelchange = f; }).catch(() => {});
+
+// ================= Dibujo 2D (manos) =================
+const octx = $("ov").getContext("2d");
+let CONN = [];
+function drawOverlay(){
+  octx.setTransform(dpr, 0, 0, dpr, 0, 0); octx.clearRect(0, 0, W, H);
+  for(const h of hs){
+    if(!h.P) continue;
+    if(S.skeleton){
+      octx.strokeStyle = "rgba(255,255,255,.8)"; octx.lineWidth = 2.5; octx.beginPath();
+      for(const c of CONN){ octx.moveTo(h.P[c.start].x, h.P[c.start].y); octx.lineTo(h.P[c.end].x, h.P[c.end].y); }
+      octx.stroke(); octx.fillStyle = "#fff";
+      for(const p of h.P){ octx.beginPath(); octx.arc(p.x, p.y, 3, 0, 7); octx.fill(); }
+    }
+    const c = cursor(h);
+    if(c){
+      octx.shadowColor = "rgba(0,0,0,.6)"; octx.shadowBlur = 12;
+      octx.strokeStyle = "#fff"; octx.fillStyle = "#fff"; octx.lineWidth = 3;
+      octx.beginPath(); octx.arc(c.x, c.y, h.down ? 7 : 16, 0, 7);
+      if(h.down) octx.fill(); else octx.stroke();
+      octx.shadowBlur = 0;
+    }
+  }
+}
+
+// ================= Bucle =================
+let lastT = -1, last = performance.now(), frame = 0, started = false;
+const tmp = new CANNON.Vec3();
+const allBtns = [...homeBtns, ...setBtns, ...dockBtns, ...barBtns];
+function loop(now){
+  requestAnimationFrame(loop);
+  const dt = Math.min((now - last)/1000, 0.05); last = now;
+  if(video.readyState >= 2 && video.currentTime !== lastT){
+    lastT = video.currentTime;
+    const L = landmarker.detectForVideo(video, now).landmarks || [];
+    processHand(hs[0], L[0]); processHand(hs[1], L[1]);
+    $("msg").textContent = L.length ? "" : "Pon tu mano frente a la cámara";
+  }
+  // hover 3D
+  const hov = new Set(); let first = null;
+  for(const h of hs){ const c = cursor(h); if(c){ if(!first) first = c; const b = pick(c); if(b) hov.add(b); } }
+  const k = 1 - Math.exp(-dt*14);
+  for(const b of allBtns){
+    const hv = hov.has(b);
+    b.pressT = Math.max(0, b.pressT - dt);
+    const tz = b.pressT > 0 ? -0.012 : hv ? 0.07 : 0, ts = hv ? 1.06 : 1;
+    b.group.position.z += (tz - b.group.position.z)*k;
+    b.group.scale.setScalar(b.group.scale.x + (ts - b.group.scale.x)*k);
+    b.mat.emissiveIntensity += ((hv ? 0.3 : 0) - b.mat.emissiveIntensity)*k;
+  }
+  // flotación + paralaje del menú
+  const t = now/1000, kk = 1 - Math.exp(-dt*4);
+  const ry = first ? ((first.x/W)*2 - 1)*0.16 : 0, rx = first ? ((first.y/H)*2 - 1)*0.10 : 0;
+  menuRoot.rotation.y += (ry + Math.sin(t*0.7)*0.03 - menuRoot.rotation.y)*kk;
+  menuRoot.rotation.x += (rx - menuRoot.rotation.x)*kk;
+  menuRoot.position.y = menuRoot.userData.baseY + Math.sin(t*1.3)*0.012;
+  barRoot.position.y = barRoot.userData.baseY + Math.sin(t*1.3)*0.004;
+  // luz que sigue al cursor
+  if(first && !mode){
+    cursorLight.position.set(((first.x/W)*2 - 1)*TAN*1.5*(W/H), -((first.y/H)*2 - 1)*TAN*1.5, -1.5);
+    cursorLight.intensity += (1.3 - cursorLight.intensity)*kk;
+  } else cursorLight.intensity += (0 - cursorLight.intensity)*kk;
+
+  // física
+  if(mode){
+    const fs = 1/60;
+    for(const h of hs){
+      if(h.grab && h.pt){
+        const tg = toWorld(h.pt), b = h.grab.body;
+        tmp.set((tg.x - b.position.x)*20, (tg.y - b.position.y)*20, (tg.z - b.position.z)*20);
+        const m = tmp.length(); if(m > 14) tmp.scale(14/m, tmp);
+        b.velocity.copy(tmp); b.angularVelocity.scale(0.85, b.angularVelocity); b.wakeUp();
+      }
+      h.bodies.forEach((b, i) => {
+        b.collisionResponse = !h.down;
+        if(h.P){
+          const tg = toWorld(h.P[TIPS[i]]);
+          tmp.set((tg.x - b.position.x)/fs, (tg.y - b.position.y)/fs, (tg.z - b.position.z)/fs);
+          const m = tmp.length(); if(m > 15) tmp.scale(15/m, tmp);
+          b.velocity.copy(tmp);
+        } else { b.position.set(0, -50, 0); b.velocity.set(0, 0, 0); }
+      });
+    }
+    world.step(fs, dt, 3);
+    for(const c of cubes){ c.mesh.position.copy(c.body.position); c.mesh.quaternion.copy(c.body.quaternion); }
+    if(frame++ % 8 === 0){
+      if(mode === "tower"){
+        let top = -1e9;
+        for(const c of cubes) if(c.body.velocity.length() < 0.6 && !hs.some(h => h.grab === c)) top = Math.max(top, c.body.position.y + c.s/2);
+        $("info").textContent = "🏗️ Altura: " + (top > -1e8 ? Math.max(0, (top - floorY)/baseS) : 0).toFixed(1) + " cubos";
+      } else $("info").textContent = "🧊 Cubos 3D · " + cubes.length;
+    }
+  } else {
+    hs.forEach(h => h.bodies.forEach(b => { b.position.set(0, -50, 0); b.velocity.set(0, 0, 0); }));
+  }
+  renderer.render(scene, camera);
+  drawOverlay();
+}
+
+$("go").onclick = async () => {
+  const go = $("go"); if(go.dataset.busy) return; go.dataset.busy = 1;
+  $("err").textContent = ""; go.textContent = "Cargando…";
+  try{
+    const fs = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    landmarker = await HandLandmarker.createFromOptions(fs, {
+      baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate:"GPU" },
+      runningMode:"VIDEO", numHands:2
+    });
+    CONN = HandLandmarker.HAND_CONNECTIONS;
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:"user", width:{ideal:1280}, height:{ideal:720} }, audio:false });
+    await video.play();
+    vw = video.videoWidth; vh = video.videoHeight;
+    resize(); refresh(); show("home"); started = true;
+    $("splash").style.display = "none";
+    requestAnimationFrame(loop);
+  }catch(e){
+    $("err").textContent = "Error: " + e.message; go.textContent = "Reintentar"; delete go.dataset.busy;
+  }
+};
+resize(); refresh(); show("home");
+if("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+</script>
+</body>
+</html>
